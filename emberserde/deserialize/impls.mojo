@@ -427,7 +427,6 @@ __extension Tuple(Deserializable):
         ](), "Tuple deserialize requires Defaultable elements"
         var result = Self()
 
-        @__parameter
         def dispose[idx: Int](var elt: Self.Ts[idx]):
             _ = rebind_var[downcast[Self.Ts[idx], Base]](elt^)
 
@@ -443,7 +442,7 @@ __extension Tuple(Deserializable):
 
             state.end()
         except e:
-            result^.deinit_with[dispose]()
+            result^.deinit_with(dispose)
             _prepend_index(e, filled)
             raise e^
 
