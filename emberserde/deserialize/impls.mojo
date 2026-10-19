@@ -376,7 +376,7 @@ __extension Counter(Deserializable):
         while m.has_next():
             try:
                 var k = m.expect_key[Self.V]()
-                result[k^] = m.expect_value[Int]()
+                result[k] = m.expect_value[Int]()
             except e:
                 _prepend_index(e, idx)
                 raise e^
@@ -420,12 +420,14 @@ __extension Tuple(Deserializable):
     @staticmethod
     def deserialize(
         mut d: Some[Deserializer],
-    ) raises DeserializationError -> Self:
+        out result: Self,
+    ) raises DeserializationError:
+        # Built in place: a `Tuple` is `Movable` only when every element is.
         var state = d.begin_tuple[Self.__len__()]()
         comptime assert Self.Ts.all_conforms_to[
             Defaultable
         ](), "Tuple deserialize requires Defaultable elements"
-        var result = Self()
+        result = Self()
 
         def dispose[idx: Int](var elt: Self.Ts[idx]):
             _ = rebind_var[downcast[Self.Ts[idx], Base]](elt^)
@@ -445,8 +447,6 @@ __extension Tuple(Deserializable):
             result^.deinit_with(dispose)
             _prepend_index(e, filled)
             raise e^
-
-        return result^
 
 
 __extension OwnedPointer(Deserializable):
