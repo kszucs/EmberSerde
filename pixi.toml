@@ -3,7 +3,7 @@ authors = ["Brian Grenier <grenierb96@gmail.com>"]
 channels = ["https://conda.modular.com/max-nightly/", "conda-forge"]
 name = "emberserde"
 platforms = ["osx-arm64", "linux-aarch64", "linux-64"]
-version = "0.1.0"
+version = "0.2.0"
 description = "A format-agnostic serialization framework for Mojo"
 license = "Apache-2.0"
 license-file = "LICENSE"
@@ -33,7 +33,7 @@ mojo = "==1.3.0.dev2026111605"
 
 [package]
 name = "emberserde"
-version = "0.1.0"
+version = "0.2.0"
 
 [package.build]
 # Backends before 0.2.6 hardcode `mojo package ... -o ....mojopkg`; 0.2.6 is the

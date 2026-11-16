@@ -3,8 +3,8 @@
 # `SelfDescribingDeserializer` with a recursive `JsonValue` behind
 # `deserialize_any` (`test_self_describing.mojo` proves the trait mechanics
 # with a primitives-only value; this format proves arbitrary nesting).
-# Correctness over performance; string fidelity is ASCII-only (same tradeoff
-# as `DebugCursor._slice`) with a minimal escape set (\" \\ \n \t \r).
+# Correctness over performance; strings use the quoting shared with the TOML
+# test format (`_text_utils.mojo`).
 #
 # Wire form: compact canonical JSON out, whitespace-tolerant in. Structs and
 # maps are `{...}` with names/keys on the wire; seqs and tuples are `[...]`;
@@ -36,6 +36,7 @@ from emberserde.deserialize import (
     Deserializer,
     Deserializable,
     RawKind,
+    RepeatPolicy,
     SelfDescribingDeserializer,
     SeqDerState,
     MapDerState,
@@ -52,24 +53,7 @@ from emberserde.error import (
 )
 from emberserde.field_meta import field_index
 from emberserde.utils import Base
-
-
-def _write_quoted(mut out: String, v: StringSlice):
-    out += '"'
-    for cp in v.codepoint_slices():
-        if cp == '"':
-            out += '\\"'
-        elif cp == "\\":
-            out += "\\\\"
-        elif cp == "\n":
-            out += "\\n"
-        elif cp == "\t":
-            out += "\\t"
-        elif cp == "\r":
-            out += "\\r"
-        else:
-            out += String(cp)
-    out += '"'
+from _text_utils import TextCursor, is_number_char, write_quoted
 
 
 @fieldwise_init
@@ -131,7 +115,7 @@ struct JsonStructSer[origin: MutOrigin](StructSerState):
         if not self.first:
             self.out[] += ","
         self.first = False
-        _write_quoted(self.out[], field_name)
+        write_quoted(self.out[], field_name)
         self.out[] += ":"
         var sub = JsonSerializer(out=self.out)
         serialize(v, sub)
@@ -187,7 +171,7 @@ struct JsonSerializer[origin: MutOrigin](Serializer):
         self.out[] += String(v)
 
     def serialize_string(mut self, v: StringSlice) raises SerializationError:
-        _write_quoted(self.out[], v)
+        write_quoted(self.out[], v)
 
     def serialize_none(mut self) raises SerializationError:
         self.out[] += "null"
@@ -234,7 +218,7 @@ struct JsonSerializer[origin: MutOrigin](Serializer):
         T: AnyType, variant: String
     ](mut self, idx: UInt32) raises SerializationError -> Self.EnumType:
         self.out[] += "{"
-        _write_quoted(self.out[], variant)
+        write_quoted(self.out[], variant)
         self.out[] += ":"
         return JsonEnumSer(out=self.out)
 
@@ -391,187 +375,67 @@ def _mismatch(message: String) -> DeserializationError:
     return DeserializationError(message, DerErrorKind.TypeMismatch)
 
 
-@fieldwise_init
-struct JsonCursor(Movable):
-    var buf: String
-    var pos: Int
+# The `_skip_*` functions consume a token without building a `String`, so
+# `raw_bytes` can hand back a span aliasing the input.
 
-    def at_end(self) -> Bool:
-        return self.pos >= self.buf.byte_length()
 
-    def peek(self) -> Int:
-        if self.at_end():
-            return -1
-        return Int(self.buf.as_bytes()[self.pos])
+# Opening quote NOT yet consumed; consumes through the closing quote.
+def _skip_string_token(mut c: TextCursor) raises DeserializationError:
+    c.advance()
+    while True:
+        if c.at_end():
+            raise _invalid(String("unterminated string"))
+        var b = c.peek()
+        c.advance()
+        if b == ord('"'):
+            return
+        if b == ord("\\"):
+            if c.at_end():
+                raise _invalid(String("unterminated escape"))
+            c.advance()
 
-    def advance(mut self):
-        self.pos += 1
 
-    def skip_ws(mut self):
-        while not self.at_end():
-            var c = self.peek()
-            if (
-                c == ord(" ")
-                or c == ord("\t")
-                or c == ord("\n")
-                or c == ord("\r")
-            ):
-                self.advance()
-            else:
-                break
+def _skip_number_token[
+    integer_only: Bool
+](mut c: TextCursor) raises DeserializationError:
+    var start = c.pos
+    var fractional = False
+    while is_number_char(c.peek()):
+        var b = c.peek()
+        if b == ord(".") or b == ord("e") or b == ord("E"):
+            fractional = True
+        c.advance()
+    if c.pos == start:
+        raise _mismatch(String("expected a number"))
+    comptime if integer_only:
+        if fractional:
+            raise _mismatch(String("expected an integer"))
 
-    def starts_with(self, lit: StringSlice) -> Bool:
-        var lb = lit.as_bytes()
-        if self.pos + lit.byte_length() > self.buf.byte_length():
-            return False
-        var bb = self.buf.as_bytes()
-        for i in range(lit.byte_length()):
-            if bb[self.pos + i] != lb[i]:
-                return False
-        return True
 
-    def expect_lit(mut self, lit: StringSlice) raises DeserializationError:
-        if not self.starts_with(lit):
-            raise _invalid(String("expected '") + String(lit) + "'")
-        self.pos += lit.byte_length()
-
-    def read_number(mut self) -> String:
-        var result = String()
-        while not self.at_end():
-            var c = self.peek()
-            var numeric = (
-                c == ord("-")
-                or c == ord("+")
-                or c == ord(".")
-                or c == ord("e")
-                or c == ord("E")
-                or (c >= ord("0") and c <= ord("9"))
-            )
-            if not numeric:
-                break
-            result += chr(c)
-            self.advance()
-        return result^
-
-    def _slice(self, start: Int, end: Int) -> String:
-        return String(
-            StringSlice(unsafe_from_utf8=self.buf.as_bytes()[start:end])
-        )
-
-    # Opening quote already consumed; consumes the closing quote. Plain bytes
-    # are appended as whole runs (per-byte `chr()` would mangle multi-byte
-    # UTF-8); only escapes interrupt a run.
-    def read_string_contents(mut self) raises DeserializationError -> String:
-        var result = String()
-        var run_start = self.pos
-        while True:
-            if self.at_end():
-                raise _invalid(String("unterminated string"))
-            var c = self.peek()
-            if c == ord('"'):
-                result += self._slice(run_start, self.pos)
-                self.advance()
-                return result^
-            if c == ord("\\"):
-                result += self._slice(run_start, self.pos)
-                self.advance()
-                if self.at_end():
-                    raise _invalid(String("unterminated escape"))
-                var e = self.peek()
-                if e == ord('"'):
-                    result += '"'
-                elif e == ord("\\"):
-                    result += "\\"
-                elif e == ord("n"):
-                    result += "\n"
-                elif e == ord("t"):
-                    result += "\t"
-                elif e == ord("r"):
-                    result += "\r"
-                else:
-                    raise _invalid(
-                        String("unsupported escape: '\\") + chr(e) + "'"
-                    )
-                self.advance()
-                run_start = self.pos
-            else:
-                self.advance()
-
-    # --- borrowing support -------------------------------------------------
-    # These consume a token without building a `String`, so `raw_bytes` can
-    # hand back a span aliasing `buf`.
-
-    def raw_span(self, start: Int, end: Int) -> Span[Byte, ImmUntrackedOrigin]:
-        # Origin-erased at the trait boundary; the borrowing type re-ties it.
-        return rebind[Span[Byte, ImmUntrackedOrigin]](
-            self.buf.as_bytes()[start:end]
-        )
-
-    # Opening quote NOT yet consumed; consumes through the closing quote.
-    def skip_string_token(mut self) raises DeserializationError:
-        self.advance()
-        while True:
-            if self.at_end():
-                raise _invalid(String("unterminated string"))
-            var c = self.peek()
-            self.advance()
-            if c == ord('"'):
-                return
-            if c == ord("\\"):
-                if self.at_end():
-                    raise _invalid(String("unterminated escape"))
-                self.advance()
-
-    def skip_number_token[
-        integer_only: Bool
-    ](mut self) raises DeserializationError:
-        var start = self.pos
-        var fractional = False
-        while not self.at_end():
-            var c = self.peek()
-            var numeric = (
-                c == ord("-")
-                or c == ord("+")
-                or c == ord(".")
-                or c == ord("e")
-                or c == ord("E")
-                or (c >= ord("0") and c <= ord("9"))
-            )
-            if not numeric:
-                break
-            if c == ord(".") or c == ord("e") or c == ord("E"):
-                fractional = True
-            self.advance()
-        if self.pos == start:
-            raise _mismatch(String("expected a number"))
-        comptime if integer_only:
-            if fractional:
-                raise _mismatch(String("expected an integer"))
-
-    # Skip one whole value: scan to the next `,`/`}`/`]` at depth zero,
-    # balancing brackets/braces and jumping over strings (with escapes).
-    def skip_json_value(mut self):
-        var depth = 0
-        while not self.at_end():
-            var c = self.peek()
-            if depth == 0 and (c == ord(",") or c == ord("}") or c == ord("]")):
-                return
-            if c == ord('"'):
-                self.advance()
-                while not self.at_end() and self.peek() != ord('"'):
-                    if self.peek() == ord("\\"):
-                        self.advance()
-                    self.advance()
-            elif c == ord("[") or c == ord("{"):
-                depth += 1
-            elif c == ord("]") or c == ord("}"):
-                depth -= 1
-            self.advance()
+# Skip one whole value: scan to the next `,`/`}`/`]` at depth zero,
+# balancing brackets/braces and jumping over strings (with escapes).
+def _skip_json_value(mut c: TextCursor):
+    var depth = 0
+    while not c.at_end():
+        var b = c.peek()
+        if depth == 0 and (b == ord(",") or b == ord("}") or b == ord("]")):
+            return
+        if b == ord('"'):
+            c.advance()
+            while not c.at_end() and c.peek() != ord('"'):
+                if c.peek() == ord("\\"):
+                    c.advance()
+                c.advance()
+        elif b == ord("[") or b == ord("{"):
+            depth += 1
+        elif b == ord("]") or b == ord("}"):
+            depth -= 1
+        c.advance()
 
 
 @fieldwise_init
-struct JsonSeqDe[origin: MutOrigin](SeqDerState):
-    var cursor: Pointer[JsonCursor, Self.origin]
+struct JsonSeqDe[origin: MutOrigin, repeat: RepeatPolicy](SeqDerState):
+    var cursor: Pointer[TextCursor, Self.origin]
 
     def has_next(mut self) raises DeserializationError -> Bool:
         self.cursor[].skip_ws()
@@ -583,7 +447,7 @@ struct JsonSeqDe[origin: MutOrigin](SeqDerState):
         return True
 
     def expect_element[T: AnyType](mut self) raises DeserializationError -> T:
-        var sub = JsonDeserializer(cursor=self.cursor)
+        var sub = JsonDeserializer[Self.origin, Self.repeat](cursor=self.cursor)
         return deserialize[T](sub)
 
     def end(mut self) raises DeserializationError:
@@ -592,8 +456,8 @@ struct JsonSeqDe[origin: MutOrigin](SeqDerState):
 
 
 @fieldwise_init
-struct JsonMapDe[origin: MutOrigin](MapDerState):
-    var cursor: Pointer[JsonCursor, Self.origin]
+struct JsonMapDe[origin: MutOrigin, repeat: RepeatPolicy](MapDerState):
+    var cursor: Pointer[TextCursor, Self.origin]
 
     def has_next(mut self) raises DeserializationError -> Bool:
         self.cursor[].skip_ws()
@@ -607,22 +471,25 @@ struct JsonMapDe[origin: MutOrigin](MapDerState):
     def expect_key[T: AnyType](mut self) raises DeserializationError -> T:
         self.cursor[].skip_ws()
         comptime if reflect[T].base_name() == "String":
-            var sub = JsonDeserializer(cursor=self.cursor)
+            var sub = JsonDeserializer[Self.origin, Self.repeat](
+                cursor=self.cursor
+            )
             return deserialize[T](sub)
         else:
             # Keys ride the wire as JSON strings (serde_json's stringify):
             # unwrap the quotes and parse the contents as a bare value.
-            self.cursor[].expect_lit('"')
-            var contents = self.cursor[].read_string_contents()
-            var kcursor = JsonCursor(contents^, 0)
-            var sub = JsonDeserializer(cursor=Pointer(to=kcursor))
+            var contents = self.cursor[].read_quoted()
+            var kcursor = TextCursor(contents^, 0)
+            var sub = JsonDeserializer[origin_of(kcursor), Self.repeat](
+                cursor=Pointer(to=kcursor)
+            )
             return deserialize[T](sub)
 
     def expect_value[T: AnyType](mut self) raises DeserializationError -> T:
         self.cursor[].skip_ws()
         self.cursor[].expect_lit(":")
         self.cursor[].skip_ws()
-        var sub = JsonDeserializer(cursor=self.cursor)
+        var sub = JsonDeserializer[Self.origin, Self.repeat](cursor=self.cursor)
         return deserialize[T](sub)
 
     def end(mut self) raises DeserializationError:
@@ -631,8 +498,8 @@ struct JsonMapDe[origin: MutOrigin](MapDerState):
 
 
 @fieldwise_init
-struct JsonStructDe[origin: MutOrigin](StructDerState):
-    var cursor: Pointer[JsonCursor, Self.origin]
+struct JsonStructDe[origin: MutOrigin, repeat: RepeatPolicy](StructDerState):
+    var cursor: Pointer[TextCursor, Self.origin]
 
     def expect_field_index[
         T: AnyType
@@ -644,8 +511,7 @@ struct JsonStructDe[origin: MutOrigin](StructDerState):
         if self.cursor[].peek() == ord(","):
             self.cursor[].advance()
             self.cursor[].skip_ws()
-        self.cursor[].expect_lit('"')
-        var name = self.cursor[].read_string_contents()
+        var name = self.cursor[].read_quoted()
         self.cursor[].skip_ws()
         self.cursor[].expect_lit(":")
         self.cursor[].skip_ws()
@@ -654,12 +520,12 @@ struct JsonStructDe[origin: MutOrigin](StructDerState):
     def expect_field_value[
         T: AnyType
     ](mut self) raises DeserializationError -> T:
-        var sub = JsonDeserializer(cursor=self.cursor)
+        var sub = JsonDeserializer[Self.origin, Self.repeat](cursor=self.cursor)
         return deserialize[T](sub)
 
     def skip_value(mut self) raises DeserializationError:
         self.cursor[].skip_ws()
-        self.cursor[].skip_json_value()
+        _skip_json_value(self.cursor[])
 
     def end(mut self) raises DeserializationError:
         self.cursor[].skip_ws()
@@ -667,8 +533,8 @@ struct JsonStructDe[origin: MutOrigin](StructDerState):
 
 
 @fieldwise_init
-struct JsonTupleDe[origin: MutOrigin](TupleDerState):
-    var cursor: Pointer[JsonCursor, Self.origin]
+struct JsonTupleDe[origin: MutOrigin, repeat: RepeatPolicy](TupleDerState):
+    var cursor: Pointer[TextCursor, Self.origin]
     var first: Bool
 
     def expect_element[T: AnyType](mut self) raises DeserializationError -> T:
@@ -677,7 +543,7 @@ struct JsonTupleDe[origin: MutOrigin](TupleDerState):
             self.cursor[].expect_lit(",")
             self.cursor[].skip_ws()
         self.first = False
-        var sub = JsonDeserializer(cursor=self.cursor)
+        var sub = JsonDeserializer[Self.origin, Self.repeat](cursor=self.cursor)
         return deserialize[T](sub)
 
     def end(mut self) raises DeserializationError:
@@ -686,15 +552,15 @@ struct JsonTupleDe[origin: MutOrigin](TupleDerState):
 
 
 @fieldwise_init
-struct JsonEnumDe[origin: MutOrigin](EnumDerState):
-    var cursor: Pointer[JsonCursor, Self.origin]
+struct JsonEnumDe[origin: MutOrigin, repeat: RepeatPolicy](EnumDerState):
+    var cursor: Pointer[TextCursor, Self.origin]
     var idx: Int
 
     def variant_index(mut self) raises DeserializationError -> Int:
         return self.idx
 
     def expect_payload[T: AnyType](mut self) raises DeserializationError -> T:
-        var sub = JsonDeserializer(cursor=self.cursor)
+        var sub = JsonDeserializer[Self.origin, Self.repeat](cursor=self.cursor)
         return deserialize[T](sub)
 
     def end(mut self) raises DeserializationError:
@@ -703,17 +569,18 @@ struct JsonEnumDe[origin: MutOrigin](EnumDerState):
 
 
 @fieldwise_init
-struct JsonDeserializer[origin: MutOrigin](
-    BorrowingDeserializer, SelfDescribingDeserializer
-):
-    var cursor: Pointer[JsonCursor, Self.origin]
+struct JsonDeserializer[
+    origin: MutOrigin, repeat: RepeatPolicy = RepeatPolicy.Error
+](BorrowingDeserializer, SelfDescribingDeserializer):
+    var cursor: Pointer[TextCursor, Self.origin]
 
-    comptime SeqType = JsonSeqDe[Self.origin]
-    comptime MapType = JsonMapDe[Self.origin]
-    comptime StructType = JsonStructDe[Self.origin]
-    comptime TupleType = JsonTupleDe[Self.origin]
-    comptime EnumType = JsonEnumDe[Self.origin]
+    comptime SeqType = JsonSeqDe[Self.origin, Self.repeat]
+    comptime MapType = JsonMapDe[Self.origin, Self.repeat]
+    comptime StructType = JsonStructDe[Self.origin, Self.repeat]
+    comptime TupleType = JsonTupleDe[Self.origin, Self.repeat]
+    comptime EnumType = JsonEnumDe[Self.origin, Self.repeat]
     comptime Value = JsonValue
+    comptime repeat_policy = Self.repeat
 
     def expect_bool(mut self) raises DeserializationError -> Bool:
         self.cursor[].skip_ws()
@@ -743,8 +610,7 @@ struct JsonDeserializer[origin: MutOrigin](
         self.cursor[].skip_ws()
         if self.cursor[].peek() != ord('"'):
             raise _mismatch(String("expected a string"))
-        self.cursor[].expect_lit('"')
-        return self.cursor[].read_string_contents()
+        return self.cursor[].read_quoted()
 
     def expect_optional[
         T: Base
@@ -760,14 +626,14 @@ struct JsonDeserializer[origin: MutOrigin](
         if self.cursor[].peek() != ord("["):
             raise _mismatch(String("expected an array"))
         self.cursor[].expect_lit("[")
-        return JsonSeqDe(cursor=self.cursor)
+        return JsonSeqDe[Self.origin, Self.repeat](cursor=self.cursor)
 
     def begin_map(mut self) raises DeserializationError -> Self.MapType:
         self.cursor[].skip_ws()
         if self.cursor[].peek() != ord("{"):
             raise _mismatch(String("expected an object"))
         self.cursor[].expect_lit("{")
-        return JsonMapDe(cursor=self.cursor)
+        return JsonMapDe[Self.origin, Self.repeat](cursor=self.cursor)
 
     def begin_struct[
         T: AnyType
@@ -778,7 +644,7 @@ struct JsonDeserializer[origin: MutOrigin](
         if self.cursor[].peek() != ord("{"):
             raise _mismatch(String("expected an object"))
         self.cursor[].expect_lit("{")
-        return JsonStructDe(cursor=self.cursor)
+        return JsonStructDe[Self.origin, Self.repeat](cursor=self.cursor)
 
     def begin_tuple[
         field_count: Int
@@ -787,7 +653,9 @@ struct JsonDeserializer[origin: MutOrigin](
         if self.cursor[].peek() != ord("["):
             raise _mismatch(String("expected an array"))
         self.cursor[].expect_lit("[")
-        return JsonTupleDe(cursor=self.cursor, first=True)
+        return JsonTupleDe[Self.origin, Self.repeat](
+            cursor=self.cursor, first=True
+        )
 
     # Externally tagged `{"Arm":payload}`: consume up to and including the
     # `:`, resolve the arm name to an index; the closing `}` is `end`'s job.
@@ -799,8 +667,7 @@ struct JsonDeserializer[origin: MutOrigin](
             raise _mismatch(String("expected an object"))
         self.cursor[].expect_lit("{")
         self.cursor[].skip_ws()
-        self.cursor[].expect_lit('"')
-        var name = self.cursor[].read_string_contents()
+        var name = self.cursor[].read_quoted()
         self.cursor[].skip_ws()
         self.cursor[].expect_lit(":")
         self.cursor[].skip_ws()
@@ -810,7 +677,7 @@ struct JsonDeserializer[origin: MutOrigin](
             comptime an = get_static_string[arm_names[i]]()
             if idx == -1 and name == an:
                 idx = i
-        return JsonEnumDe(cursor=self.cursor, idx=idx)
+        return JsonEnumDe[Self.origin, Self.repeat](cursor=self.cursor, idx=idx)
 
     # Mirrors EmberJson's six `expect_*_bytes` parser entry points: one
     # validated skip, specialised by the kind the caller demands. The span
@@ -824,11 +691,11 @@ struct JsonDeserializer[origin: MutOrigin](
         comptime if kind == RawKind.Str:
             if self.cursor[].peek() != ord('"'):
                 raise _mismatch(String("expected a string"))
-            self.cursor[].skip_string_token()
+            _skip_string_token(self.cursor[])
         elif kind == RawKind.Integer:
-            self.cursor[].skip_number_token[True]()
+            _skip_number_token[True](self.cursor[])
         elif kind == RawKind.Float:
-            self.cursor[].skip_number_token[False]()
+            _skip_number_token[False](self.cursor[])
         else:
             comptime if kind == RawKind.Seq:
                 if self.cursor[].peek() != ord("["):
@@ -838,9 +705,12 @@ struct JsonDeserializer[origin: MutOrigin](
                     raise _mismatch(String("expected an object"))
             if self.cursor[].at_end():
                 raise _invalid(String("expected a JSON value"))
-            self.cursor[].skip_json_value()
+            _skip_json_value(self.cursor[])
 
-        return self.cursor[].raw_span(start, self.cursor[].pos)
+        # Origin-erased at the trait boundary; the borrowing type re-ties it.
+        return rebind[Span[Byte, ImmUntrackedOrigin]](
+            self.cursor[].buf.as_bytes()[start : self.cursor[].pos]
+        )
 
     # `expect_struct` is intentionally NOT implemented: the framework's
     # reflection-driven default on `Deserializer` drives the framing above.
@@ -887,10 +757,12 @@ struct JsonDeserializer[origin: MutOrigin](
 
 
 def from_json[
-    T: Deinitable
+    T: Deinitable, repeat: RepeatPolicy = RepeatPolicy.Error
 ](var s: String, out result: T) raises DeserializationError:
-    var cursor = JsonCursor(s^, 0)
-    var d = JsonDeserializer(cursor=Pointer(to=cursor))
+    var cursor = TextCursor(s^, 0)
+    var d = JsonDeserializer[origin_of(cursor), repeat](
+        cursor=Pointer(to=cursor)
+    )
     result = deserialize[T](d)
     d.cursor[].skip_ws()
     if not d.cursor[].at_end():

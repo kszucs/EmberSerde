@@ -10,15 +10,16 @@ from _json_format import from_json, to_json, JsonValue, JsonDeserializer
 from emberserde.deserialize import (
     Deserializable,
     Deserializer,
+    RepeatPolicy,
     SelfDescribingDeserializer,
 )
 from emberserde.error import DerErrorKind, DeserializationError
 from emberserde.field import Rename
 from emberserde.struct_modifiers import (
     RenameAll,
-    RenamePolicy,
     DenyUnknownFields,
 )
+from emberserde.validate import Range, Size
 
 
 @fieldwise_init
@@ -51,21 +52,23 @@ struct Outer(Copyable, Defaultable, Movable):
         self.inner = Point()
 
 
+@__annotation(DenyUnknownFields())
 @fieldwise_init
-struct Strict(Copyable, DenyUnknownFields, Movable):
+struct Strict(Copyable, Movable):
     var a: Int
 
 
+@__annotation(RenameAll(.CamelCase))
 @fieldwise_init
-struct CamelRec(Copyable, Movable, RenameAll):
-    comptime FieldRenamePolicy = RenamePolicy.CamelCase
+struct CamelRec(Copyable, Movable):
     var first_name: Int
     var age: Int
 
 
 @fieldwise_init
 struct Renamed(Copyable, Movable):
-    var keep_me: Rename[Int, String("kept")]
+    @__annotation(Rename("kept"))
+    var keep_me: Int
 
 
 def test_primitives() raises:
@@ -81,6 +84,12 @@ def test_string_escapes() raises:
     assert_equal(from_json[String]('"say \\"hi\\""'), String('say "hi"'))
     assert_equal(from_json[String]('"a\\\\b"'), String("a\\b"))
     assert_equal(from_json[String]('"a\\nb\\tc\\rd"'), String("a\nb\tc\rd"))
+    assert_equal(from_json[String]('"\\b\\f\\/\\u00e9"'), String("\x08\x0c/é"))
+
+
+def test_raw_control_character_rejected() raises:
+    with assert_raises(contains="control character"):
+        _ = from_json[String]('"a\x01b"')
 
 
 def test_unicode_string() raises:
@@ -158,6 +167,62 @@ def test_struct_duplicate_field_raises() raises:
         _ = from_json[Point]('{"x":1,"x":2,"y":3}')
 
 
+@fieldwise_init
+struct Bag(Defaultable, Movable):
+    var name: String
+
+    @__annotation(Size(2, 3))
+    var xs: List[Int]
+    var m: Dict[String, Int]
+
+    @__annotation(Range(1, 65535))
+    var port: Int
+
+    def __init__(out self):
+        self.name = String()
+        self.xs = []
+        self.m = {}
+        self.port = 1
+
+
+def test_last_wins_replaces_every_repeated_field() raises:
+    var b = from_json[Bag, repeat=RepeatPolicy.LastWins](
+        '{"name":"a","xs":[1],"m":{"k":1},"port":0,'
+        '"name":"b","xs":[2,3],"m":{"j":2},"port":80}'
+    )
+    assert_equal(b.name, "b")
+    assert_equal(b.xs, [2, 3])
+    assert_equal(len(b.m), 1)
+    assert_equal(b.m["j"], 2)
+    # The check runs once, on the value the repeats left: port 0 never
+    # fails it.
+    assert_equal(b.port, 80)
+
+
+def test_append_seqs_extends_lists_and_maps() raises:
+    var b = from_json[Bag, repeat=RepeatPolicy.AppendSeqs](
+        '{"name":"n","xs":[1],"m":{"k":1,"j":1},"xs":[2],"m":{"j":2},"port":5}'
+    )
+    # Size(2, 3) sees the appended list, not [1].
+    assert_equal(b.xs, [1, 2])
+    assert_equal(b.m["k"], 1)
+    assert_equal(b.m["j"], 2)
+
+
+def test_append_seqs_still_rejects_a_repeated_scalar() raises:
+    var kind = DerErrorKind.Custom
+    var path = String()
+    try:
+        _ = from_json[Bag, repeat=RepeatPolicy.AppendSeqs](
+            '{"name":"n","xs":[1,2],"m":{},"port":5,"port":6}'
+        )
+    except e:
+        kind = e.kind
+        path = e.path
+    assert_equal(kind, DerErrorKind.DuplicateField)
+    assert_equal(path, ".port")
+
+
 def test_deny_unknown_fields_raises() raises:
     with assert_raises(contains="Unknown field: b"):
         _ = from_json[Strict]('{"a":1,"b":2}')
@@ -171,7 +236,7 @@ def test_rename_all_matches_wire() raises:
 
 def test_field_rename_matches_wire() raises:
     var r = from_json[Renamed]('{"kept":2}')
-    assert_equal(r.keep_me.value, 2)
+    assert_equal(r.keep_me, 2)
 
 
 def test_tuple() raises:
